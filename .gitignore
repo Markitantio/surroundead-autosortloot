@@ -1,0 +1,21 @@
+# Сборка
+Output_ninja/
+build/
+*.dll
+*.obj
+*.pdb
+*.lib
+*.exp
+
+# IDE
+.vs/
+.vscode/
+*.user
+CMakeSettings.json
+
+# UE4SS (большой, ставить через свой установщик)
+RE-UE4SS/
+
+# Личное
+*.log
+UE4SS.log
