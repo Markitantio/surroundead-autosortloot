@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
+#include <algorithm>
 #include <fstream>
 
 using namespace RC;
@@ -21,14 +23,12 @@ using namespace RC::Unreal;
 
 namespace AutoSortHooks
 {
-    // =================================================================
-    // ============================ CONFIG =============================
-    // =================================================================
+    // ================== CONFIG ==================
 
     struct SortSettings {
         int hotkey = VK_F9;
         bool verboseLogs = false;
-        StringType unknownItemAction = STR("Skip"); // "Skip" | "MoveToRoot"
+        StringType unknownItemAction = STR("Skip");
         StringType rootContainer = STR("LargeBlackMilitaryBackpack");
         std::map<StringType, std::vector<StringType>> mapping;
     };
@@ -36,7 +36,6 @@ namespace AutoSortHooks
     static SortSettings G_Settings;
     static StringType  G_ConfigPath;
 
-    // --- UTF-8 helpers (для корректной работы с русским в комментариях)
     static std::string WToU8(const std::wstring& w)
     {
         if (w.empty()) return {};
@@ -47,20 +46,20 @@ namespace AutoSortHooks
                             out.data(), n, nullptr, nullptr);
         return out;
     }
-
     static std::wstring U8ToW(const std::string& s)
     {
         if (s.empty()) return {};
-        int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(),
-                                    nullptr, 0);
+        int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
         std::wstring out(n, 0);
-        MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(),
-                            out.data(), n);
+        MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), out.data(), n);
         return out;
     }
 
-    static void TrimString(StringType& s)
+    static void StripBomAndTrim(StringType& s)
     {
+        while (!s.empty() && (s.front() == 0xFEFF || s.front() == 0x200B
+                              || s.front() == 0x00A0))
+            s.erase(s.begin());
         auto isSpace = [](wchar_t c) {
             return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n';
         };
@@ -73,13 +72,14 @@ namespace AutoSortHooks
         if (v.empty()) return false;
         StringType s = v;
         for (auto& c : s) c = std::towlower(c);
+        StripBomAndTrim(s);
         return s == L"true" || s == L"1" || s == L"yes" || s == L"on";
     }
 
     static int ParseHotkey(const StringType& raw)
     {
         StringType s = raw;
-        TrimString(s);
+        StripBomAndTrim(s);
         for (auto& c : s) c = std::towupper(c);
         if (s.empty()) return 0;
         if (s.size() >= 2 && s[0] == L'F') {
@@ -108,14 +108,14 @@ namespace AutoSortHooks
         StringType cur;
         for (wchar_t c : raw) {
             if (c == L',') {
-                TrimString(cur);
+                StripBomAndTrim(cur);
                 if (!cur.empty()) out.push_back(cur);
                 cur.clear();
             } else {
                 cur.push_back(c);
             }
         }
-        TrimString(cur);
+        StripBomAndTrim(cur);
         if (!cur.empty()) out.push_back(cur);
         return out;
     }
@@ -126,9 +126,6 @@ namespace AutoSortHooks
         return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
     }
 
-    // Конфиг лежит рядом с папкой dlls/ у мода:
-    //   .../ue4ss/Mods/AutoSortLoot/dlls/main.dll
-    //   .../ue4ss/Mods/AutoSortLoot/AutoSortLoot.ini
     static StringType GetConfigPath()
     {
         HMODULE hMod = nullptr;
@@ -145,10 +142,10 @@ namespace AutoSortHooks
         StringType p(path);
         size_t p1 = p.find_last_of(L"\\/");
         if (p1 == StringType::npos) return StringType(L"AutoSortLoot.ini");
-        p = p.substr(0, p1);                       // .../dlls/
+        p = p.substr(0, p1);
         size_t p2 = p.find_last_of(L"\\/");
         if (p2 == StringType::npos) return StringType(L"AutoSortLoot.ini");
-        p = p.substr(0, p2);                       // .../AutoSortLoot/
+        p = p.substr(0, p2);
         p += L"\\AutoSortLoot.ini";
         return p;
     }
@@ -160,60 +157,27 @@ namespace AutoSortHooks
         content += L";  AutoSortLoot - config\r\n";
         content += L"; ============================================================\r\n";
         content += L"; После изменения файла перезапустите игру.\r\n";
-        content += L";\r\n";
-        content += L"; [Settings]  - основные настройки\r\n";
-        content += L"; [Mapping]   - правила распределения предметов\r\n";
         content += L";\r\n\r\n";
 
         content += L"[Settings]\r\n";
-        content += L"; Клавиша сортировки.\r\n";
-        content += L"; Поддерживается: F1..F12, 0..9, A..Z,\r\n";
-        content += L";   INSERT, HOME, END, DELETE, PAGEUP, PAGEDOWN, SPACE, TAB\r\n";
-        content += L"Hotkey=F9\r\n\r\n";
-
-        content += L"; Подробные логи в UE4SS.log (true/false).\r\n";
-        content += L"; false = только итог и результат по каждому предмету.\r\n";
-        content += L"VerboseLogs=false\r\n\r\n";
-
-        content += L"; Что делать с предметами, для которых нет правила в [Mapping]:\r\n";
-        content += L";   Skip       = не трогать (по умолчанию)\r\n";
-        content += L";   MoveToRoot = переместить в RootContainer\r\n";
-        content += L"UnknownItemAction=Skip\r\n\r\n";
-
-        content += L"; Имя корневого контейнера для UnknownItemAction=MoveToRoot\r\n";
+        content += L"Hotkey=F9\r\n";
+        content += L"VerboseLogs=false\r\n";
+        content += L"UnknownItemAction=Skip\r\n";
         content += L"RootContainer=LargeBlackMilitaryBackpack\r\n\r\n";
 
         content += L"[Mapping]\r\n";
-        content += L"; Формат: <ItemType>=<Container1>,<Container2>,...\r\n";
-        content += L"; Мод перебирает контейнеры по порядку и кладёт предмет в первый,\r\n";
-        content += L"; у которого есть свободный слот. Если ни одного нет - предмет остаётся.\r\n";
-        content += L";\r\n";
-        content += L"; Префикс \"Jig.ItemType.\" можно опускать.\r\n";
-        content += L"; Полный список типов см. в JSON-дампе игры (поле ItemType).\r\n\r\n";
-
-        content += L"; --- Медицина ---\r\n";
-        content += L"MedicalConsumable=MedBag\r\n\r\n";
-
-        content += L"; --- Еда и питьё ---\r\n";
+        content += L"MedicalConsumable=MedBag\r\n";
         content += L"FoodConsumable=LunchBox\r\n";
-        content += L"DrinkConsumable=LunchBox\r\n\r\n";
-
-        content += L"; --- Оружие ---\r\n";
+        content += L"DrinkConsumable=LunchBox\r\n";
         content += L"MainFirearm=WeaponsCase\r\n";
         content += L"Sidearm=WeaponsCase\r\n";
-        content += L"Melee=WeaponsCase\r\n\r\n";
-
-        content += L"; --- Боеприпасы и обвесы ---\r\n";
+        content += L"Melee=WeaponsCase\r\n";
         content += L"Ammunition=AmmoTin,WeaponsCase\r\n";
         content += L"WeaponAttachment=AmmoTin,WeaponsCase\r\n";
         content += L"EquipmentAttachment=AmmoTin,WeaponsCase\r\n";
-        content += L"Throwable=AmmoTin,WeaponsCase\r\n\r\n";
-
-        content += L"; --- Материалы и инструменты ---\r\n";
+        content += L"Throwable=AmmoTin,WeaponsCase\r\n";
         content += L"Material=LargeToolbox,SmallToolbox\r\n";
-        content += L"Tool=LargeToolbox,SmallToolbox\r\n\r\n";
-
-        content += L"; --- Ценности ---\r\n";
+        content += L"Tool=LargeToolbox,SmallToolbox\r\n";
         content += L"Currency=Wallet,Safe,Briefcase\r\n";
         content += L"Keycard=Wallet,Safe,Briefcase\r\n";
 
@@ -233,14 +197,29 @@ namespace AutoSortHooks
 
         while (std::getline(f, raw)) {
             if (!raw.empty() && raw.back() == '\r') raw.pop_back();
+
+            if (raw.size() >= 3
+                && (uint8_t)raw[0] == 0xEF
+                && (uint8_t)raw[1] == 0xBB
+                && (uint8_t)raw[2] == 0xBF)
+            {
+                raw.erase(0, 3);
+            }
+            if (raw.size() >= 2
+                && (uint8_t)raw[0] == 0xFF
+                && (uint8_t)raw[1] == 0xFE)
+            {
+                raw.erase(0, 2);
+            }
+
             StringType line = U8ToW(raw);
-            TrimString(line);
+            StripBomAndTrim(line);
             if (line.empty()) continue;
             if (line[0] == L';' || line[0] == L'#') continue;
 
             if (line.front() == L'[' && line.back() == L']') {
                 curSection = line.substr(1, line.size() - 2);
-                TrimString(curSection);
+                StripBomAndTrim(curSection);
                 continue;
             }
 
@@ -249,8 +228,8 @@ namespace AutoSortHooks
 
             StringType key   = line.substr(0, eq);
             StringType value = line.substr(eq + 1);
-            TrimString(key);
-            TrimString(value);
+            StripBomAndTrim(key);
+            StripBomAndTrim(value);
 
             if (curSection == L"Settings") {
                 if (key == L"Hotkey") {
@@ -293,15 +272,12 @@ namespace AutoSortHooks
             G_Settings.verboseLogs ? 1 : 0);
     }
 
-    // =================================================================
-    // ========================== UTILITIES ============================
-    // =================================================================
+    // ================== UTILITIES ==================
 
     bool G_HookRegistered = false;
     bool G_ScannerRunning = false;
     bool G_HotkeyWasDown = false;
 
-    // verbose-логи только когда включён флаг
     #define SORT_V(...) do { if (G_Settings.verboseLogs) \
         Output::send<LogLevel::Verbose>(__VA_ARGS__); } while(0)
 
@@ -312,6 +288,8 @@ namespace AutoSortHooks
 
     static int32_t ReadI32(void* b, int32_t o)
     { return *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(b) + o); }
+    static uint32_t ReadU32(void* b, int32_t o)
+    { return *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(b) + o); }
     static double ReadDouble(void* b, int32_t o)
     { return *reinterpret_cast<double*>(reinterpret_cast<uint8_t*>(b) + o); }
     static void* ReadPtr(void* b, int32_t o)
@@ -376,6 +354,12 @@ namespace AutoSortHooks
         return ReadFNameAt(da, 0x68);
     }
 
+    StringType GetContainerTypeTag(UObject* jsi)
+    {
+        if (!jsi) return StringType(STR(""));
+        return ReadFNameAt(jsi, 0x38C);
+    }
+
     bool GetContainerUid(UObject* jsi, uint8_t outUid[16])
     {
         if (!jsi) return false;
@@ -428,10 +412,134 @@ namespace AutoSortHooks
         return CallFunc(jigComp, STR("EventOnInventoryAction"), buf, sizeof(buf));
     }
 
+    // ===== Фильтры =====
+
+    // ObjectFlags @ 0x08: RF_MirroredGarbage (0x40000000) / RF_PendingKill old (0x02000000)
+    static bool IsPendingKill(UObject* o)
+    {
+        if (!o) return true;
+        uint32_t flags = ReadU32(o, 0x08);
+        return (flags & 0x42000000u) != 0;
+    }
+
+    // Собираем set UID из MainJigContainers (0xC0) игрока — авторитетный список
+    static std::set<std::string> GetActiveUidSet(UObject* jigComp)
+    {
+        std::set<std::string> uids;
+        if (!jigComp) return uids;
+        SimpleTArray* arr = reinterpret_cast<SimpleTArray*>(
+            reinterpret_cast<uint8_t*>(jigComp) + 0xC0);
+        if (!arr || arr->Num <= 0 || !arr->Data) return uids;
+        uint8_t* items = reinterpret_cast<uint8_t*>(arr->Data);
+        for (int32_t i = 0; i < arr->Num; ++i) {
+            uint8_t* mc = items + (i * 0x50);
+            // пропускаем пустые UID
+            bool zero = true;
+            for (int k = 0; k < 16; ++k) if (mc[k]) { zero = false; break; }
+            if (zero) continue;
+            uids.insert(std::string(reinterpret_cast<char*>(mc), 16));
+        }
+        return uids;
+    }
+
+    static StringType BuildOuterChain(UObject* obj, int maxDepth)
+    {
+        StringType chain;
+        UObject* cur = obj;
+        for (int i = 0; i < maxDepth && cur; ++i) {
+            cur = cur->GetOuterPrivate();
+            if (!cur) break;
+            StringType nm = cur->GetName();
+            UClass* cls = cur->GetClassPrivate();
+            StringType cn = cls ? cls->GetName() : StringType(STR("?"));
+            if (!chain.empty()) chain += STR("|");
+            chain += nm;
+            chain += STR("/");
+            chain += cn;
+        }
+        return chain;
+    }
+
+    static bool ChainContainsAny(const StringType& chain, const wchar_t* const* keys)
+    {
+        for (size_t i = 0; keys[i]; ++i) {
+            if (chain.find(keys[i]) != StringType::npos) return true;
+        }
+        return false;
+    }
+
+    static bool IsWorldContainer(UObject* jsi)
+    {
+        if (!jsi) return false;
+        static const wchar_t* WORLD_KEYS[] = {
+            L"W_LargeLootContainerUI",
+            L"W_LootContainerUI",
+            L"W_DeadPlayerLootUI",
+            L"W_VicinityLootUI",
+            L"Container_CompoundCrate",
+            L"Container_POICrate",
+            L"Container_DeadPlayerLoot",
+            L"AirdropContainer_",
+            L"Master_AirdropContainer",
+            L"BP_LootContainer",
+            L"BP_LootContainerWidget",
+            nullptr
+        };
+        StringType chain = BuildOuterChain(jsi, 12);
+        return ChainContainsAny(chain, WORLD_KEYS);
+    }
+
     static bool IsTrueContainerType(const StringType& itemType)
     {
         return itemType == STR("Jig.ItemType.Container")
             || itemType == STR("Jig.ItemType.Backpack");
+    }
+
+    static bool IsChildOfWeapon(UObject* jsi)
+    {
+        if (!jsi) return false;
+        void* sm = ReadPtr(jsi, 0x6A0);
+        if (!sm) return false;
+        void* da = ReadPtr(sm, 0x4F0);
+        if (!da) return false;
+        StringType smType = ReadFNameAt(da, 0x68);
+        return smType == STR("Jig.ItemType.MainFirearm")
+            || smType == STR("Jig.ItemType.Sidearm")
+            || smType == STR("Jig.ItemType.Melee");
+    }
+
+    // Валидный сортировочный контейнер:
+    //  1) Object не pending kill
+    //  2) Его UID есть в MainJigContainers игрока (активный в этой сессии)
+    //  3) ContainerType != EquipTo
+    //  4) Не под-контейнер оружия
+    //  5) Не мировой контейнер
+    static bool IsValidSortContainer(UObject* jsi, const std::set<std::string>& activeUids)
+    {
+        if (!jsi) return false;
+        if (IsPendingKill(jsi)) return false;
+
+        uint8_t uid[16];
+        if (!GetContainerUid(jsi, uid)) return false;
+        if (activeUids.find(std::string(reinterpret_cast<char*>(uid), 16))
+                == activeUids.end())
+            return false;
+
+        StringType ctype = GetContainerTypeTag(jsi);
+        if (ctype == STR("Jig.ContainerType.EquipTo")) return false;
+        if (IsChildOfWeapon(jsi)) return false;
+        if (IsWorldContainer(jsi)) return false;
+        return true;
+    }
+
+    static UObject* FindInventoryContainer(const std::vector<UObject*>& sources)
+    {
+        for (UObject* j : sources) {
+            if (!j) continue;
+            StringType ctype = GetContainerTypeTag(j);
+            if (ctype == STR("Jig.ContainerType.Inventory")) return j;
+        }
+        return nullptr;
     }
 
     static bool ListContains(const std::vector<StringType>& lst, const StringType& v)
@@ -451,89 +559,129 @@ namespace AutoSortHooks
     {
         Output::send<LogLevel::Verbose>(STR("[Sort] === START ===\n"));
 
+        // 0) Собираем активные UID из MainJigContainers
+        std::set<std::string> activeUids = GetActiveUidSet(jigComp);
+        SORT_V(STR("[Sort] active UIDs in MainJigContainers: {}\n"),
+               (int)activeUids.size());
+
         std::vector<UObject*> allJsi;
         UObjectGlobals::FindAllOf(STR("JSIContainer_C"), allJsi);
 
+        std::vector<UObject*> sources;
         std::map<StringType, std::vector<UObject*>> byItemId;
         int skipNonContainerJsi = 0;
+        int skipStale = 0;
 
         for (UObject* j : allJsi) {
             if (!j) continue;
             uint8_t uid[16];
             if (!GetContainerUid(j, uid)) { ++skipNonContainerJsi; continue; }
-            StringType cType = GetContainerItemType(j);
-            if (!IsTrueContainerType(cType)) { ++skipNonContainerJsi; continue; }
+            if (!IsValidSortContainer(j, activeUids)) {
+                // отдельно посчитаем stale (uid не в MainJigContainers)
+                if (activeUids.find(std::string(reinterpret_cast<char*>(uid), 16))
+                        == activeUids.end())
+                    ++skipStale;
+                else
+                    ++skipNonContainerJsi;
+                continue;
+            }
+
+            sources.push_back(j);
+
             StringType itemId = GetContainerItemId(j);
-            if (itemId.empty()) { ++skipNonContainerJsi; continue; }
-            byItemId[itemId].push_back(j);
+            StringType itemType = GetContainerItemType(j);
+            if (!itemId.empty() && IsTrueContainerType(itemType)) {
+                byItemId[itemId].push_back(j);
+            }
         }
 
-        SORT_V(STR("[Sort] контейнеров: {} (skip non-container: {})\n"),
-               (int)byItemId.size(), skipNonContainerJsi);
+        SORT_V(STR("[Sort] источников: {} (skip non-container: {}, stale: {})\n"),
+               (int)sources.size(), skipNonContainerJsi, skipStale);
         for (auto& kv : byItemId) {
-            SORT_V(STR("[Sort]   {} x {}\n"), kv.first, (int)kv.second.size());
+            SORT_V(STR("[Sort]   target {} x {}\n"), kv.first, (int)kv.second.size());
         }
+
+        UObject* defaultInventory = FindInventoryContainer(sources);
+        bool rootContainerValid = (byItemId.find(G_Settings.rootContainer) != byItemId.end());
+
+        SORT_V(STR("[Sort] RootContainer='{}' valid={}, inventoryFallback={}\n"),
+               G_Settings.rootContainer, rootContainerValid ? 1 : 0,
+               defaultInventory ? 1 : 0);
 
         // ===== План =====
         std::vector<PlannedMove> plan;
         int skipNoRule = 0, skipInPlace = 0, skipNoTarget = 0, skipContainer = 0;
 
-        for (auto& kv : byItemId) {
-            StringType srcItemId = kv.first;
-            for (UObject* srcJsi : kv.second) {
-                if (!srcJsi) continue;
-                SimpleTArray* items = reinterpret_cast<SimpleTArray*>(
-                    reinterpret_cast<uint8_t*>(srcJsi) + 0x490);
-                if (!items || items->Num <= 0 || !items->Data) continue;
-                UObject** arr = reinterpret_cast<UObject**>(items->Data);
-                for (int32_t i = 0; i < items->Num; ++i) {
-                    UObject* iw = arr[i];
-                    if (!iw) continue;
+        for (UObject* srcJsi : sources) {
+            StringType srcItemId = GetContainerItemId(srcJsi);
 
-                    StringType iType = GetItemTypeOf(iw);
+            SimpleTArray* items = reinterpret_cast<SimpleTArray*>(
+                reinterpret_cast<uint8_t*>(srcJsi) + 0x490);
+            if (!items || items->Num <= 0 || !items->Data) continue;
+            UObject** arr = reinterpret_cast<UObject**>(items->Data);
 
-                    // Пропускаем только сами контейнеры-предметы
-                    if (!iType.empty() && IsTrueContainerType(iType)) {
-                        ++skipContainer; continue;
-                    }
+            for (int32_t i = 0; i < items->Num; ++i) {
+                UObject* iw = arr[i];
+                if (!iw) continue;
+                if (IsPendingKill(iw)) continue;
 
-                    // Определяем список целей
-                    std::vector<StringType> targets;
-                    auto it = G_Settings.mapping.find(iType);
-                    if (it != G_Settings.mapping.end()) {
-                        targets = it->second;
-                    } else {
-                        // Правила нет
-                        if (G_Settings.unknownItemAction == STR("MoveToRoot")
-                            && !G_Settings.rootContainer.empty()
-                            && srcItemId != G_Settings.rootContainer)
-                        {
+                StringType iType = GetItemTypeOf(iw);
+                if (iType.empty()) { ++skipNoRule; continue; }
+                if (IsTrueContainerType(iType)) { ++skipContainer; continue; }
+
+                std::vector<StringType> targets;
+                auto it = G_Settings.mapping.find(iType);
+                if (it != G_Settings.mapping.end()) {
+                    targets = it->second;
+                } else {
+                    if (G_Settings.unknownItemAction == STR("MoveToRoot")) {
+                        if (rootContainerValid) {
                             targets.push_back(G_Settings.rootContainer);
-                        } else {
-                            ++skipNoRule; continue;
+                        } else if (defaultInventory && defaultInventory != srcJsi) {
+                            targets.push_back(STR("__INVENTORY__"));
                         }
                     }
                     if (targets.empty()) { ++skipNoRule; continue; }
-
-                    // Уже в целевом?
-                    if (ListContains(targets, srcItemId)) { ++skipInPlace; continue; }
-
-                    // Есть ли хоть один подходящий контейнер у игрока?
-                    bool hasAny = false;
-                    for (auto& t : targets) {
-                        auto jt = byItemId.find(t);
-                        if (jt != byItemId.end() && !jt->second.empty()) { hasAny = true; break; }
-                    }
-                    if (!hasAny) { ++skipNoTarget; continue; }
-
-                    PlannedMove m{};
-                    std::memcpy(m.itemUid, reinterpret_cast<uint8_t*>(iw) + 0x5A0, 16);
-                    m.srcJsi = srcJsi;
-                    m.itemId = GetItemIdOf(iw);
-                    m.itemType = iType;
-                    plan.push_back(m);
                 }
+
+                if (!srcItemId.empty() && ListContains(targets, srcItemId)) {
+                    ++skipInPlace; continue;
+                }
+
+                bool hasAny = false;
+                for (auto& t : targets) {
+                    if (t == STR("__INVENTORY__")) {
+                        if (defaultInventory && defaultInventory != srcJsi) { hasAny = true; break; }
+                        continue;
+                    }
+                    auto jt = byItemId.find(t);
+                    if (jt != byItemId.end() && !jt->second.empty()) { hasAny = true; break; }
+                }
+                if (!hasAny) { ++skipNoTarget; continue; }
+
+                PlannedMove m{};
+                std::memcpy(m.itemUid, reinterpret_cast<uint8_t*>(iw) + 0x5A0, 16);
+                m.srcJsi = srcJsi;
+                m.itemId = GetItemIdOf(iw);
+                m.itemType = iType;
+                plan.push_back(m);
             }
+        }
+
+        // ---- dedup по UID
+        size_t beforeDedup = plan.size();
+        {
+            std::vector<PlannedMove> deduped;
+            std::set<std::string> seen;
+            for (auto& m : plan) {
+                std::string key(reinterpret_cast<const char*>(m.itemUid), 16);
+                if (seen.insert(key).second) deduped.push_back(m);
+            }
+            plan.swap(deduped);
+        }
+        if (plan.size() != beforeDedup) {
+            SORT_V(STR("[Sort] plan dedup: {} -> {}\n"),
+                   (int)beforeDedup, (int)plan.size());
         }
 
         SORT_V(STR("[Sort] план: {} (skip: noRule={} inPlace={} noTarget={} container={})\n"),
@@ -554,9 +702,12 @@ namespace AutoSortHooks
             auto it = G_Settings.mapping.find(m.itemType);
             if (it != G_Settings.mapping.end()) {
                 targets = it->second;
-            } else if (G_Settings.unknownItemAction == STR("MoveToRoot")
-                       && !G_Settings.rootContainer.empty()) {
-                targets.push_back(G_Settings.rootContainer);
+            } else if (G_Settings.unknownItemAction == STR("MoveToRoot")) {
+                if (rootContainerValid) {
+                    targets.push_back(G_Settings.rootContainer);
+                } else if (defaultInventory && defaultInventory != m.srcJsi) {
+                    targets.push_back(STR("__INVENTORY__"));
+                }
             }
             if (targets.empty()) { ++movedFail; continue; }
 
@@ -565,6 +716,18 @@ namespace AutoSortHooks
             StringType chosenId;
 
             for (auto& t : targets) {
+                if (t == STR("__INVENTORY__")) {
+                    if (defaultInventory && defaultInventory != m.srcJsi) {
+                        int32_t s = TryGetEmptySlotNative(defaultInventory, sx, sy);
+                        if (s >= 0) {
+                            chosenDst = defaultInventory;
+                            chosenSlot = s;
+                            chosenId = STR("Inventory");
+                        }
+                    }
+                    continue;
+                }
+
                 auto jt = byItemId.find(t);
                 if (jt == byItemId.end()) continue;
                 for (UObject* cand : jt->second) {
@@ -588,8 +751,8 @@ namespace AutoSortHooks
             }
 
             Output::send<LogLevel::Verbose>(
-                STR("[Sort] MOVE '{}' ({}) -> {} slot={}\n"),
-                m.itemId, m.itemType, chosenId, chosenSlot);
+                STR("[Sort] MOVE '{}' ({}) from {} -> {} slot={}\n"),
+                m.itemId, m.itemType, SafeName(m.srcJsi), chosenId, chosenSlot);
 
             DoEventOnInventoryAction(jigComp, m.srcJsi, chosenDst,
                                      item, nullptr, chosenSlot, false);
@@ -609,6 +772,7 @@ namespace AutoSortHooks
         UObjectGlobals::FindAllOf(STR("BP_JigComponent_C"), all);
         for (UObject* c : all) {
             if (!c) continue;
+            if (IsPendingKill(c)) continue;
             StringType on = SafeName(c->GetOuterPrivate());
             if (on.find(STR("BP_PlayerCharacter")) != std::wstring::npos) return c;
         }
