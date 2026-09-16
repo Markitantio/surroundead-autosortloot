@@ -202,15 +202,11 @@ namespace AutoSortHooks
                 && (uint8_t)raw[0] == 0xEF
                 && (uint8_t)raw[1] == 0xBB
                 && (uint8_t)raw[2] == 0xBF)
-            {
                 raw.erase(0, 3);
-            }
             if (raw.size() >= 2
                 && (uint8_t)raw[0] == 0xFF
                 && (uint8_t)raw[1] == 0xFE)
-            {
                 raw.erase(0, 2);
-            }
 
             StringType line = U8ToW(raw);
             StripBomAndTrim(line);
@@ -368,6 +364,19 @@ namespace AutoSortHooks
         return false;
     }
 
+    // Считаем «живые» слоты контейнера
+    static int32_t CountWSlots(UObject* jsi)
+    {
+        if (!jsi) return 0;
+        SimpleTArray* arr = reinterpret_cast<SimpleTArray*>(
+            reinterpret_cast<uint8_t*>(jsi) + 0x3A8);
+        if (!arr || arr->Num <= 0 || !arr->Data) return 0;
+        // проверим, что первые слоты не null
+        UObject** slots = reinterpret_cast<UObject**>(arr->Data);
+        if (!slots || !slots[0]) return 0;
+        return arr->Num;
+    }
+
     UObject* FindItemWidgetByUID(UObject* jsi, const uint8_t* uid)
     {
         if (!jsi) return nullptr;
@@ -387,6 +396,8 @@ namespace AutoSortHooks
     int32_t TryGetEmptySlotNative(UObject* jsi, double dimX, double dimY)
     {
         if (!jsi) return -1;
+        if (CountWSlots(jsi) <= 0) return -1;
+
         uint8_t buf[0x40] = {};
         *reinterpret_cast<double*>(buf + 0x00) = dimX;
         *reinterpret_cast<double*>(buf + 0x08) = dimY;
@@ -414,7 +425,6 @@ namespace AutoSortHooks
 
     // ===== Фильтры =====
 
-    // ObjectFlags @ 0x08: RF_MirroredGarbage (0x40000000) / RF_PendingKill old (0x02000000)
     static bool IsPendingKill(UObject* o)
     {
         if (!o) return true;
@@ -422,7 +432,6 @@ namespace AutoSortHooks
         return (flags & 0x42000000u) != 0;
     }
 
-    // Собираем set UID из MainJigContainers (0xC0) игрока — авторитетный список
     static std::set<std::string> GetActiveUidSet(UObject* jigComp)
     {
         std::set<std::string> uids;
@@ -433,7 +442,6 @@ namespace AutoSortHooks
         uint8_t* items = reinterpret_cast<uint8_t*>(arr->Data);
         for (int32_t i = 0; i < arr->Num; ++i) {
             uint8_t* mc = items + (i * 0x50);
-            // пропускаем пустые UID
             bool zero = true;
             for (int k = 0; k < 16; ++k) if (mc[k]) { zero = false; break; }
             if (zero) continue;
@@ -508,12 +516,6 @@ namespace AutoSortHooks
             || smType == STR("Jig.ItemType.Melee");
     }
 
-    // Валидный сортировочный контейнер:
-    //  1) Object не pending kill
-    //  2) Его UID есть в MainJigContainers игрока (активный в этой сессии)
-    //  3) ContainerType != EquipTo
-    //  4) Не под-контейнер оружия
-    //  5) Не мировой контейнер
     static bool IsValidSortContainer(UObject* jsi, const std::set<std::string>& activeUids)
     {
         if (!jsi) return false;
@@ -559,7 +561,6 @@ namespace AutoSortHooks
     {
         Output::send<LogLevel::Verbose>(STR("[Sort] === START ===\n"));
 
-        // 0) Собираем активные UID из MainJigContainers
         std::set<std::string> activeUids = GetActiveUidSet(jigComp);
         SORT_V(STR("[Sort] active UIDs in MainJigContainers: {}\n"),
                (int)activeUids.size());
@@ -571,13 +572,13 @@ namespace AutoSortHooks
         std::map<StringType, std::vector<UObject*>> byItemId;
         int skipNonContainerJsi = 0;
         int skipStale = 0;
+        int skipNoSlots = 0;
 
         for (UObject* j : allJsi) {
             if (!j) continue;
             uint8_t uid[16];
             if (!GetContainerUid(j, uid)) { ++skipNonContainerJsi; continue; }
             if (!IsValidSortContainer(j, activeUids)) {
-                // отдельно посчитаем stale (uid не в MainJigContainers)
                 if (activeUids.find(std::string(reinterpret_cast<char*>(uid), 16))
                         == activeUids.end())
                     ++skipStale;
@@ -585,6 +586,10 @@ namespace AutoSortHooks
                     ++skipNonContainerJsi;
                 continue;
             }
+
+            // Фильтр по наличию слотов
+            int32_t ws = CountWSlots(j);
+            if (ws <= 0) { ++skipNoSlots; continue; }
 
             sources.push_back(j);
 
@@ -595,10 +600,20 @@ namespace AutoSortHooks
             }
         }
 
-        SORT_V(STR("[Sort] источников: {} (skip non-container: {}, stale: {})\n"),
-               (int)sources.size(), skipNonContainerJsi, skipStale);
+        // Сортируем кандидатов по убыванию WSlots.Num
         for (auto& kv : byItemId) {
-            SORT_V(STR("[Sort]   target {} x {}\n"), kv.first, (int)kv.second.size());
+            std::sort(kv.second.begin(), kv.second.end(),
+                [](UObject* a, UObject* b) {
+                    return CountWSlots(a) > CountWSlots(b);
+                });
+        }
+
+        SORT_V(STR("[Sort] источников: {} (skip non-container: {}, stale: {}, no-slots: {})\n"),
+               (int)sources.size(), skipNonContainerJsi, skipStale, skipNoSlots);
+        for (auto& kv : byItemId) {
+            SORT_V(STR("[Sort]   target {} x {} (max WSlots={})\n"),
+                   kv.first, (int)kv.second.size(),
+                   kv.second.empty() ? 0 : CountWSlots(kv.second[0]));
         }
 
         UObject* defaultInventory = FindInventoryContainer(sources);
@@ -668,7 +683,6 @@ namespace AutoSortHooks
             }
         }
 
-        // ---- dedup по UID
         size_t beforeDedup = plan.size();
         {
             std::vector<PlannedMove> deduped;
@@ -730,7 +744,9 @@ namespace AutoSortHooks
 
                 auto jt = byItemId.find(t);
                 if (jt == byItemId.end()) continue;
+                int checked = 0;
                 for (UObject* cand : jt->second) {
+                    if (checked++ >= 5) break;
                     if (cand == m.srcJsi) continue;
                     int32_t s = TryGetEmptySlotNative(cand, sx, sy);
                     if (s >= 0) {
@@ -745,7 +761,28 @@ namespace AutoSortHooks
 
             if (!chosenDst) {
                 Output::send<LogLevel::Verbose>(
-                    STR("[Sort] нет места для '{}' ({})\n"), m.itemId, m.itemType);
+                    STR("[Sort] нет места для '{}' ({}) — кандидаты:\n"),
+                    m.itemId, m.itemType);
+                for (auto& t : targets) {
+                    auto jt = byItemId.find(t);
+                    if (jt == byItemId.end()) {
+                        Output::send<LogLevel::Verbose>(
+                            STR("[Sort]   '{}' не найден\n"), t);
+                        continue;
+                    }
+                    int shown = 0;
+                    for (UObject* cand : jt->second) {
+                        if (shown++ >= 3) break;
+                        Output::send<LogLevel::Verbose>(
+                            STR("[Sort]   cand {} outer='{}' WSlots={} items={}\n"),
+                            SafeName(cand),
+                            SafeName(cand->GetOuterPrivate()),
+                            CountWSlots(cand),
+                            [&]{ SimpleTArray* ia = reinterpret_cast<SimpleTArray*>(
+                                    reinterpret_cast<uint8_t*>(cand) + 0x490);
+                                 return ia ? ia->Num : -1; }());
+                    }
+                }
                 ++movedFail;
                 continue;
             }
