@@ -17,6 +17,8 @@
 #include <set>
 #include <algorithm>
 #include <fstream>
+#include <thread>
+#include <chrono>
 
 using namespace RC;
 using namespace RC::Unreal;
@@ -30,6 +32,7 @@ namespace AutoSortHooks
         bool verboseLogs = false;
         StringType unknownItemAction = STR("Skip");
         StringType rootContainer = STR("LargeBlackMilitaryBackpack");
+        bool wakeClosedContainers = true;   // v12
         std::map<StringType, std::vector<StringType>> mapping;
     };
 
@@ -163,7 +166,8 @@ namespace AutoSortHooks
         content += L"Hotkey=F9\r\n";
         content += L"VerboseLogs=false\r\n";
         content += L"UnknownItemAction=Skip\r\n";
-        content += L"RootContainer=LargeBlackMilitaryBackpack\r\n\r\n";
+        content += L"RootContainer=LargeBlackMilitaryBackpack\r\n";
+        content += L"WakeClosedContainers=true\r\n\r\n";
 
         content += L"[Mapping]\r\n";
         content += L"MedicalConsumable=MedBag\r\n";
@@ -237,6 +241,8 @@ namespace AutoSortHooks
                     G_Settings.unknownItemAction = value;
                 } else if (key == L"RootContainer") {
                     G_Settings.rootContainer = value;
+                } else if (key == L"WakeClosedContainers") {   // v12
+                    G_Settings.wakeClosedContainers = ParseBool(value);
                 }
             } else if (curSection == L"Mapping") {
                 StringType fullKey = key;
@@ -263,9 +269,10 @@ namespace AutoSortHooks
         }
         LoadConfigFromFile(G_ConfigPath);
         Output::send<LogLevel::Verbose>(
-            STR("[AutoSortLoot] config loaded: hotkey=0x{:X}, rules={}, verbose={}\n"),
+            STR("[AutoSortLoot] config loaded: hotkey=0x{:X}, rules={}, verbose={}, wake={}\n"),
             G_Settings.hotkey, (int)G_Settings.mapping.size(),
-            G_Settings.verboseLogs ? 1 : 0);
+            G_Settings.verboseLogs ? 1 : 0,
+            G_Settings.wakeClosedContainers ? 1 : 0);
     }
 
     // ================== UTILITIES ==================
@@ -276,6 +283,9 @@ namespace AutoSortHooks
 
     #define SORT_V(...) do { if (G_Settings.verboseLogs) \
         Output::send<LogLevel::Verbose>(__VA_ARGS__); } while(0)
+
+    #define SORT_ALWAYS(...) \
+        Output::send<LogLevel::Verbose>(__VA_ARGS__)
 
     static StringType SafeName(UObject* o)
     { return o ? o->GetName() : StringType(STR("<null>")); }
@@ -364,18 +374,209 @@ namespace AutoSortHooks
         return false;
     }
 
-    // Считаем «живые» слоты контейнера
     static int32_t CountWSlots(UObject* jsi)
     {
         if (!jsi) return 0;
         SimpleTArray* arr = reinterpret_cast<SimpleTArray*>(
             reinterpret_cast<uint8_t*>(jsi) + 0x3A8);
         if (!arr || arr->Num <= 0 || !arr->Data) return 0;
-        // проверим, что первые слоты не null
         UObject** slots = reinterpret_cast<UObject**>(arr->Data);
         if (!slots || !slots[0]) return 0;
         return arr->Num;
     }
+
+    // v12: сырое Num без проверки на не-null[0] — для диагностики
+    static int32_t RawWSlotsNum(UObject* jsi)
+    {
+        if (!jsi) return 0;
+        SimpleTArray* arr = reinterpret_cast<SimpleTArray*>(
+            reinterpret_cast<uint8_t*>(jsi) + 0x3A8);
+        return (arr && arr->Data) ? arr->Num : 0;
+    }
+
+    // v12: чтение полей диагностики
+    static int32_t GetContainerNumCols(UObject* j) { return j ? ReadI32(j, 0x39C) : 0; }
+    static int32_t GetContainerNumRows(UObject* j) { return j ? ReadI32(j, 0x3A0) : 0; }
+    static bool    GetContainerInitialized(UObject* j)
+    { return j && *reinterpret_cast<bool*>(reinterpret_cast<uint8_t*>(j) + 0x378); }
+    static double  GetContainerSlotSizeX(UObject* j) { return j ? ReadDouble(j, 0x3C8) : 0.0; }
+    static double  GetContainerSlotSizeY(UObject* j) { return j ? ReadDouble(j, 0x3D0) : 0.0; }
+    static double  GetContainerMaxWeight(UObject* j) { return j ? ReadDouble(j, 0x5A8) : 0.0; }
+    static bool    GetContainerIsMain(UObject* j)
+    { return j && *reinterpret_cast<bool*>(reinterpret_cast<uint8_t*>(j) + 0x800); }
+    static bool    GetContainerIsPartSpecial(UObject* j)
+    { return j && *reinterpret_cast<bool*>(reinterpret_cast<uint8_t*>(j) + 0x711); }
+
+    // =========================================================================
+    // v12: WAKE PHASE
+    // =========================================================================
+
+    struct ContainerDiag {
+        UObject*   jsi;
+        StringType outerName;
+        StringType scName;      // имя SC_*_C, если найден
+        StringType itemId;
+        int32_t    cols;
+        int32_t    rows;
+        int32_t    wslotsNum;   // сырое Num
+        bool       initialized;
+        double     slotSizeX;
+        double     slotSizeY;
+        double     maxWeight;
+        bool       isMain;
+        bool       isPartSpecial;
+        bool       needWake;
+    };
+
+    // Находим SC_*_C по Outer-цепочке: jsi -> WidgetTree -> SC_*_C
+    static UObject* FindOwningSpecialContainer(UObject* jsi)
+    {
+        if (!jsi) return nullptr;
+        UObject* outer = jsi->GetOuterPrivate();       // WidgetTree
+        if (!outer) return nullptr;
+        UObject* candidate = outer->GetOuterPrivate(); // SC_*_C
+        if (!candidate) return nullptr;
+        UClass* cls = candidate->GetClassPrivate();
+        if (!cls) return nullptr;
+        StringType cn = cls->GetName();
+        if (cn.find(STR("SC_")) == 0) return candidate;
+        return nullptr;
+    }
+
+    static ContainerDiag DiagnoseContainer(UObject* jsi)
+    {
+        ContainerDiag d{};
+        d.jsi = jsi;
+        d.outerName = SafeName(jsi ? jsi->GetOuterPrivate() : nullptr);
+        d.itemId = GetContainerItemId(jsi);
+        d.cols = GetContainerNumCols(jsi);
+        d.rows = GetContainerNumRows(jsi);
+        d.wslotsNum = RawWSlotsNum(jsi);
+        d.initialized = GetContainerInitialized(jsi);
+        d.slotSizeX = GetContainerSlotSizeX(jsi);
+        d.slotSizeY = GetContainerSlotSizeY(jsi);
+        d.maxWeight = GetContainerMaxWeight(jsi);
+        d.isMain = GetContainerIsMain(jsi);
+        d.isPartSpecial = GetContainerIsPartSpecial(jsi);
+
+        UObject* sc = FindOwningSpecialContainer(jsi);
+        if (sc) {
+            UClass* cls = sc->GetClassPrivate();
+            d.scName = cls ? cls->GetName() : SafeName(sc);
+        }
+
+        // v12: подозрительность — не опираемся на Init (он всегда false)
+        d.needWake = false;
+        if (d.wslotsNum == 0) d.needWake = true;
+        else if (d.cols > 0 && d.rows > 0 && d.wslotsNum != d.cols * d.rows) d.needWake = true;
+        else if (d.slotSizeX <= 0.0 || d.slotSizeY <= 0.0) d.needWake = true;
+
+        return d;
+    }
+
+    static StringType DiagToString(const ContainerDiag& d)
+    {
+        StringType s;
+        s += STR("cols=");     s += std::to_wstring(d.cols);
+        s += STR(" rows=");    s += std::to_wstring(d.rows);
+        s += STR(" WSlots=");  s += std::to_wstring(d.wslotsNum);
+        s += STR(" Init=");    s += (d.initialized ? L"1" : L"0");
+        s += STR(" SlotSize=(");
+        s += std::to_wstring((int)d.slotSizeX); s += STR(",");
+        s += std::to_wstring((int)d.slotSizeY); s += STR(")");
+        s += STR(" MaxW=");    s += std::to_wstring((int)d.maxWeight);
+        if (d.isMain) s += STR(" Main");
+        if (d.isPartSpecial) s += STR(" PartSpecial");
+        return s;
+    }
+
+    // v12: forward declaration (определение ниже, в блоке "Фильтры")
+    static bool IsPendingKill(UObject* o);
+
+    // v12: имя метода — возвращает широкую строку для fmt/wide-контекста
+    static const wchar_t* WakeMethodName(int m)
+    {
+        switch (m) {
+            case 1: return L"ForceInitJsi";
+            case 2: return L"PreInitSC";
+            case 3: return L"ForceInitSC";
+            case 4: return L"Initialize";
+            case 5: return L"ReInit";
+            default: return L"nothing";
+        }
+    }
+
+    // Пробуем разбудить контейнер. Возвращает код:
+    //  0 = нечего вызывать
+    //  1 = ForceInitSpecialcontainer на JSI
+    //  2 = PreInitSpecialContainer на SC_*
+    //  3 = ForceInitSpecialcontainer на SC_*
+    //  4 = Initialize(false) на JSI
+    //  5 = Re-Init(cols, rows) на JSI
+    static int TryWakeContainer(UObject* jsi, int32_t cols, int32_t rows)
+    {
+        if (!jsi || IsPendingKill(jsi)) return 0;
+        UClass* jsiCls = jsi->GetClassPrivate();
+        if (!jsiCls) return 0;
+
+        UObject* sc = FindOwningSpecialContainer(jsi);
+
+        // 1. ForceInitSpecialcontainer на JSI
+        if (UFunction* fn = jsiCls->GetFunctionByName(STR("ForceInitSpecialcontainer"))) {
+            uint8_t buf[0x40] = {};
+            jsi->ProcessEvent(fn, buf);
+            return 1;
+        }
+
+        // 2. PreInitSpecialContainer на SC_*
+        if (sc) {
+            UClass* scCls = sc->GetClassPrivate();
+            if (scCls) {
+                if (UFunction* fn = scCls->GetFunctionByName(STR("PreInitSpecialContainer"))) {
+                    uint8_t buf[0x40] = {};
+                    sc->ProcessEvent(fn, buf);
+                    return 2;
+                }
+            }
+        }
+
+        // 3. ForceInitSpecialcontainer на SC_*
+        if (sc) {
+            UClass* scCls = sc->GetClassPrivate();
+            if (scCls) {
+                if (UFunction* fn = scCls->GetFunctionByName(STR("ForceInitSpecialcontainer"))) {
+                    uint8_t buf[0x40] = {};
+                    sc->ProcessEvent(fn, buf);
+                    return 3;
+                }
+            }
+        }
+
+        // 4. Initialize(false) на JSI
+        if (UFunction* fn = jsiCls->GetFunctionByName(STR("Initialize"))) {
+            uint8_t buf[0x40] = {};
+            buf[0] = 0; // Design = false
+            jsi->ProcessEvent(fn, buf);
+            return 4;
+        }
+
+        // 5. Re-Init(cols, rows) на JSI
+        if (cols > 0 && rows > 0) {
+            if (UFunction* fn = jsiCls->GetFunctionByName(STR("Re-Init"))) {
+                uint8_t buf[0x40] = {};
+                *reinterpret_cast<int32_t*>(buf + 0x00) = cols;
+                *reinterpret_cast<int32_t*>(buf + 0x04) = rows;
+                jsi->ProcessEvent(fn, buf);
+                return 5;
+            }
+        }
+
+        return 0;
+    }
+
+    // =========================================================================
+    // v10 — без изменений
+    // =========================================================================
 
     UObject* FindItemWidgetByUID(UObject* jsi, const uint8_t* uid)
     {
@@ -557,22 +758,27 @@ namespace AutoSortHooks
         StringType itemType;
     };
 
+    // =========================================================================
+    // ГЛАВНАЯ ФУНКЦИЯ — SortLoot (v12)
+    // =========================================================================
     void SortLoot(UObject* jigComp)
     {
-        Output::send<LogLevel::Verbose>(STR("[Sort] === START ===\n"));
+        SORT_ALWAYS(STR("[Sort] === START ===\n"));
 
         std::set<std::string> activeUids = GetActiveUidSet(jigComp);
-        SORT_V(STR("[Sort] active UIDs in MainJigContainers: {}\n"),
-               (int)activeUids.size());
+        SORT_ALWAYS(STR("[Sort] active UIDs in MainJigContainers: {}\n"),
+                    (int)activeUids.size());
 
         std::vector<UObject*> allJsi;
         UObjectGlobals::FindAllOf(STR("JSIContainer_C"), allJsi);
 
-        std::vector<UObject*> sources;
-        std::map<StringType, std::vector<UObject*>> byItemId;
+        // -----------------------------------------------------------------
+        // ФАЗА 1: собрать «сырых» кандидатов (без фильтра no-slots),
+        //         чтобы увидеть и «мертвые» контейнеры.
+        // -----------------------------------------------------------------
+        std::vector<UObject*> rawCandidates;
         int skipNonContainerJsi = 0;
         int skipStale = 0;
-        int skipNoSlots = 0;
 
         for (UObject* j : allJsi) {
             if (!j) continue;
@@ -586,8 +792,89 @@ namespace AutoSortHooks
                     ++skipNonContainerJsi;
                 continue;
             }
+            rawCandidates.push_back(j);
+        }
 
-            // Фильтр по наличию слотов
+        SORT_ALWAYS(STR("[Sort] rawCandidates: {} (skip non-container: {}, stale: {})\n"),
+                    (int)rawCandidates.size(), skipNonContainerJsi, skipStale);
+
+        // -----------------------------------------------------------------
+        // ФАЗА 2: WAKE PHASE
+        // -----------------------------------------------------------------
+        int wokeForceJsi = 0, wokePreInitSC = 0, wokeForceSC = 0,
+            wokeInit = 0, wokeReInit = 0, wokeNothing = 0;
+        int suspiciousCount = 0;
+        int fixedCount = 0, stillBrokenCount = 0;
+
+        if (G_Settings.wakeClosedContainers) {
+            SORT_ALWAYS(STR("[Sort] === WAKE PHASE ===\n"));
+
+            // Диагностика до
+            std::vector<ContainerDiag> suspicious;
+            for (UObject* j : rawCandidates) {
+                ContainerDiag d = DiagnoseContainer(j);
+                SORT_ALWAYS(STR("[Sort] pre '{}' sc='{}' outer='{}' {}\n"),
+                            d.itemId, d.scName, d.outerName, DiagToString(d));
+                if (d.needWake) {
+                    ++suspiciousCount;
+                    suspicious.push_back(d);
+                }
+            }
+
+            SORT_ALWAYS(STR("[Sort] suspicious: {}\n"), suspiciousCount);
+
+            // Пробуем будить
+            for (auto& d : suspicious) {
+                if (!d.jsi || IsPendingKill(d.jsi)) continue;
+                int method = TryWakeContainer(d.jsi, d.cols, d.rows);
+                switch (method) {
+                    case 1: ++wokeForceJsi; break;
+                    case 2: ++wokePreInitSC; break;
+                    case 3: ++wokeForceSC; break;
+                    case 4: ++wokeInit; break;
+                    case 5: ++wokeReInit; break;
+                    default: ++wokeNothing; break;
+                }
+
+                // Даём игре переварить
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+                if (IsPendingKill(d.jsi)) {
+                    SORT_ALWAYS(STR("[Sort] wake '{}' via={} -> pending kill\n"),
+                                d.itemId, WakeMethodName(method));
+                    ++stillBrokenCount;
+                    continue;
+                }
+
+                ContainerDiag after = DiagnoseContainer(d.jsi);
+                bool fixed = !after.needWake;
+                if (fixed) ++fixedCount; else ++stillBrokenCount;
+
+                SORT_ALWAYS(STR("[Sort] wake '{}' via={} -> {} status={}\n"),
+                            after.itemId, WakeMethodName(method),
+                            DiagToString(after),
+                            fixed ? L"FIXED" : L"STILL-BROKEN");
+            }
+
+            SORT_ALWAYS(STR("[Sort] wake summary: suspicious={} fixed={} still={} "
+                            "(ForceInitJsi={} PreInitSC={} ForceInitSC={} Initialize={} ReInit={} nothing={})\n"),
+                        suspiciousCount, fixedCount, stillBrokenCount,
+                        wokeForceJsi, wokePreInitSC, wokeForceSC,
+                        wokeInit, wokeReInit, wokeNothing);
+
+            SORT_ALWAYS(STR("[Sort] === WAKE PHASE END ===\n"));
+        } else {
+            SORT_ALWAYS(STR("[Sort] wake phase: disabled (WakeClosedContainers=false)\n"));
+        }
+
+        // -----------------------------------------------------------------
+        // ФАЗА 3: источники и цели (как v10)
+        // -----------------------------------------------------------------
+        std::vector<UObject*> sources;
+        std::map<StringType, std::vector<UObject*>> byItemId;
+        int skipNoSlots = 0;
+
+        for (UObject* j : rawCandidates) {
             int32_t ws = CountWSlots(j);
             if (ws <= 0) { ++skipNoSlots; continue; }
 
@@ -600,30 +887,44 @@ namespace AutoSortHooks
             }
         }
 
-        // Сортируем кандидатов по убыванию WSlots.Num
+        // Сортировка кандидатов: сначала канонические SC_*_C, потом остальные;
+        // внутри группы — по убыванию WSlots.Num
         for (auto& kv : byItemId) {
             std::sort(kv.second.begin(), kv.second.end(),
                 [](UObject* a, UObject* b) {
+                    auto isCanonical = [](UObject* c) {
+                        UObject* outer = c ? c->GetOuterPrivate() : nullptr;
+                        if (!outer) return false;
+                        UClass* cls = outer->GetClassPrivate();
+                        if (!cls) return false;
+                        StringType cn = cls->GetName();
+                        return cn.find(STR("SC_")) == 0;
+                    };
+                    bool ca = isCanonical(a);
+                    bool cb = isCanonical(b);
+                    if (ca != cb) return ca;
                     return CountWSlots(a) > CountWSlots(b);
                 });
         }
 
-        SORT_V(STR("[Sort] источников: {} (skip non-container: {}, stale: {}, no-slots: {})\n"),
-               (int)sources.size(), skipNonContainerJsi, skipStale, skipNoSlots);
+        SORT_ALWAYS(STR("[Sort] источников: {} (skip no-slots: {})\n"),
+                    (int)sources.size(), skipNoSlots);
         for (auto& kv : byItemId) {
-            SORT_V(STR("[Sort]   target {} x {} (max WSlots={})\n"),
-                   kv.first, (int)kv.second.size(),
-                   kv.second.empty() ? 0 : CountWSlots(kv.second[0]));
+            SORT_ALWAYS(STR("[Sort]   target {} x {} (max WSlots={})\n"),
+                        kv.first, (int)kv.second.size(),
+                        kv.second.empty() ? 0 : CountWSlots(kv.second[0]));
         }
 
         UObject* defaultInventory = FindInventoryContainer(sources);
         bool rootContainerValid = (byItemId.find(G_Settings.rootContainer) != byItemId.end());
 
-        SORT_V(STR("[Sort] RootContainer='{}' valid={}, inventoryFallback={}\n"),
-               G_Settings.rootContainer, rootContainerValid ? 1 : 0,
-               defaultInventory ? 1 : 0);
+        SORT_ALWAYS(STR("[Sort] RootContainer='{}' valid={}, inventoryFallback={}\n"),
+                    G_Settings.rootContainer, rootContainerValid ? 1 : 0,
+                    defaultInventory ? 1 : 0);
 
-        // ===== План =====
+        // -----------------------------------------------------------------
+        // ФАЗА 4: план
+        // -----------------------------------------------------------------
         std::vector<PlannedMove> plan;
         int skipNoRule = 0, skipInPlace = 0, skipNoTarget = 0, skipContainer = 0;
 
@@ -698,10 +999,12 @@ namespace AutoSortHooks
                    (int)beforeDedup, (int)plan.size());
         }
 
-        SORT_V(STR("[Sort] план: {} (skip: noRule={} inPlace={} noTarget={} container={})\n"),
-               (int)plan.size(), skipNoRule, skipInPlace, skipNoTarget, skipContainer);
+        SORT_ALWAYS(STR("[Sort] план: {} (skip: noRule={} inPlace={} noTarget={} container={})\n"),
+                    (int)plan.size(), skipNoRule, skipInPlace, skipNoTarget, skipContainer);
 
-        // ===== Выполнение =====
+        // -----------------------------------------------------------------
+        // ФАЗА 5: выполнение (как v10)
+        // -----------------------------------------------------------------
         int movedOk = 0, movedFail = 0;
         for (auto& m : plan) {
             UObject* item = FindItemWidgetByUID(m.srcJsi, m.itemUid);
@@ -760,47 +1063,38 @@ namespace AutoSortHooks
             }
 
             if (!chosenDst) {
-                Output::send<LogLevel::Verbose>(
-                    STR("[Sort] нет места для '{}' ({}) — кандидаты:\n"),
-                    m.itemId, m.itemType);
+                SORT_ALWAYS(STR("[Sort] нет места для '{}' ({}) — кандидаты:\n"),
+                            m.itemId, m.itemType);
                 for (auto& t : targets) {
                     auto jt = byItemId.find(t);
                     if (jt == byItemId.end()) {
-                        Output::send<LogLevel::Verbose>(
-                            STR("[Sort]   '{}' не найден\n"), t);
+                        SORT_ALWAYS(STR("[Sort]   '{}' не найден\n"), t);
                         continue;
                     }
                     int shown = 0;
                     for (UObject* cand : jt->second) {
                         if (shown++ >= 3) break;
-                        Output::send<LogLevel::Verbose>(
-                            STR("[Sort]   cand {} outer='{}' WSlots={} items={}\n"),
-                            SafeName(cand),
-                            SafeName(cand->GetOuterPrivate()),
-                            CountWSlots(cand),
-                            [&]{ SimpleTArray* ia = reinterpret_cast<SimpleTArray*>(
-                                    reinterpret_cast<uint8_t*>(cand) + 0x490);
-                                 return ia ? ia->Num : -1; }());
+                        ContainerDiag d = DiagnoseContainer(cand);
+                        SORT_ALWAYS(STR("[Sort]   cand '{}' sc='{}' outer='{}' {}\n"),
+                                    d.itemId, d.scName, d.outerName, DiagToString(d));
                     }
                 }
                 ++movedFail;
                 continue;
             }
 
-            Output::send<LogLevel::Verbose>(
-                STR("[Sort] MOVE '{}' ({}) from {} -> {} slot={}\n"),
-                m.itemId, m.itemType, SafeName(m.srcJsi), chosenId, chosenSlot);
+            SORT_ALWAYS(STR("[Sort] MOVE '{}' ({}) from {} -> {} slot={}\n"),
+                        m.itemId, m.itemType, SafeName(m.srcJsi), chosenId, chosenSlot);
 
             DoEventOnInventoryAction(jigComp, m.srcJsi, chosenDst,
                                      item, nullptr, chosenSlot, false);
 
             UObject* still = FindItemWidgetByUID(m.srcJsi, m.itemUid);
-            if (still) { ++movedFail; Output::send<LogLevel::Verbose>(STR("[Sort]   FAIL\n")); }
-            else       { ++movedOk;   Output::send<LogLevel::Verbose>(STR("[Sort]   OK\n"));   }
+            if (still) { ++movedFail; SORT_ALWAYS(STR("[Sort]   FAIL\n")); }
+            else       { ++movedOk;   SORT_ALWAYS(STR("[Sort]   OK\n"));   }
         }
 
-        Output::send<LogLevel::Verbose>(
-            STR("[Sort] === DONE ok={} fail={} ===\n"), movedOk, movedFail);
+        SORT_ALWAYS(STR("[Sort] === DONE ok={} fail={} ===\n"), movedOk, movedFail);
     }
 
     UObject* FindPlayerJigComponent()
@@ -830,14 +1124,14 @@ namespace AutoSortHooks
         bool down = (GetAsyncKeyState(G_Settings.hotkey) & 0x8000) != 0;
         if (down && !G_HotkeyWasDown && !G_ScannerRunning) {
             G_ScannerRunning = true;
-            Output::send<LogLevel::Verbose>(STR("[Scanner] === SCAN START ===\n"));
+            SORT_ALWAYS(STR("[Scanner] === SCAN START ===\n"));
             UObject* jigComp = FindPlayerJigComponent();
             if (!jigComp) {
-                Output::send<LogLevel::Verbose>(STR("[Scanner] jigComp не найден\n"));
+                SORT_ALWAYS(STR("[Scanner] jigComp не найден\n"));
             } else {
                 SortLoot(jigComp);
             }
-            Output::send<LogLevel::Verbose>(STR("[Scanner] === SCAN END ===\n"));
+            SORT_ALWAYS(STR("[Scanner] === SCAN END ===\n"));
             G_ScannerRunning = false;
         }
         G_HotkeyWasDown = down;
