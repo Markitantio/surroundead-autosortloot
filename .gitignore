@@ -1,35 +1,62 @@
-# Prerequisites
-*.d
+# ============================================================
+# AutoSortLoot — .gitignore
+# ============================================================
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+# ---- Windows env-var literal paths (accidental artifacts) ----
+%SystemDrive%/
+%SystemRoot%/
+%TEMP%/
+%USERPROFILE%/
+%APPDATA%/
+%LOCALAPPDATA%/
 
-# Precompiled Headers
-*.gch
-*.pch
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
+# ---- Build artifacts ----
+Output_ninja/
+out/
+build/
+bin/
+obj/
+*.pdb
+*.ilk
+*.exp
 *.lib
-
-# Executables
+*.obj
+*.dll
 *.exe
-*.out
-*.app
+*.ps1
+*.ini
 
-BuildFiles/
-Output/
+# ---- CMake cache ----
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeUserPresets.json
+_deps/
+cargo/
+
+# ---- Visual Studio ----
+.vs/
+.vscode/
+ipch/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.suo
+*.user
+*.vsconfig
+
+# ---- UE4SS framework (external, huge) ----
+RE-UE4SS/
+
+# ---- Temp / local ----
+_backup/
+*.log
+*.tmp
+*.bak
+Thumbs.db
+Desktop.ini
+
+# ---- Rust (used by UE4SS build, not by us) ----
+target/
+Cargo.lock
